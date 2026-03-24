@@ -47,8 +47,33 @@ RARITY_TABLE: List[Dict[str, Any]] = [
     {"name": "legendary", "weight": 4, "yield_min": 11, "yield_max": 16},
 ]
 
-DATA_LOCK = threading.Lock()
+DATA_LOCK = threading.RLock()
 BOT_STATUS_CALLBACK = None
+
+I18N: Dict[str, Dict[str, str]] = {
+    "ru": {
+        "about": "Я не поддерживаю наркотики, это просто игра для развлечения.",
+        "menu_title": "🌿 Меню экономики",
+        "settings": "⚙️ Настройки",
+        "language_set_ru": "Язык изменён на русский 🇷🇺",
+        "language_set_en": "Language switched to English 🇬🇧",
+        "no_plants_water": "💧 У тебя нет растений для полива.",
+        "water_done": "💧 Полито растений: **{count}**.",
+        "care_done": "🧤 Уход выполнен. Урожайность повышена.",
+        "inventory": "🎒 Инвентарь",
+    },
+    "en": {
+        "about": "I do not support drugs, this game is just for fun.",
+        "menu_title": "🌿 Economy Menu",
+        "settings": "⚙️ Settings",
+        "language_set_ru": "Язык изменён на русский 🇷🇺",
+        "language_set_en": "Language switched to English 🇬🇧",
+        "no_plants_water": "💧 You have no plants to water.",
+        "water_done": "💧 Watered plants: **{count}**.",
+        "care_done": "🧤 Plant care done. Yield improved.",
+        "inventory": "🎒 Inventory",
+    },
+}
 
 
 # ================================================================
@@ -106,6 +131,8 @@ def default_player(username: str) -> Dict[str, Any]:
         "auto_watering": False,
         "fertilizers": 0,
         "chemicals": 0,
+        "inventory": {"lamps": 0},
+        "language": "ru",
         "farm": None,
         "contraband": None,
     }
@@ -145,7 +172,16 @@ def get_player(data: Dict[str, Any], user: discord.abc.User) -> Dict[str, Any]:
     players[uid].setdefault("auto_watering", False)
     players[uid].setdefault("fertilizers", 0)
     players[uid].setdefault("chemicals", 0)
+    players[uid].setdefault("inventory", {"lamps": 0})
+    players[uid].setdefault("language", "ru")
     return players[uid]
+
+
+def tr(player: Dict[str, Any], key: str, **kwargs: Any) -> str:
+    lang = player.get("language", "ru")
+    table = I18N.get(lang, I18N["ru"])
+    template = table.get(key, I18N["ru"].get(key, key))
+    return template.format(**kwargs)
 
 
 def add_xp(player: Dict[str, Any], amount: int) -> Optional[str]:
@@ -170,9 +206,10 @@ def cooldown_left(player: Dict[str, Any], key: str, seconds: int) -> int:
 def growth_seconds_for_player(player: Dict[str, Any]) -> int:
     growth_level = int(player["upgrades"]["growth_level"])
     reduction = int(PLANT_BASE_GROWTH * min(0.75, growth_level * 0.08))
+    lamp_reduction = min(8, int(player.get("inventory", {}).get("lamps", 0)))
     boosted = now_ts() < int(player.get("smoke_until", 0))
     smoke_bonus = 5 if boosted else 0
-    return max(8, PLANT_BASE_GROWTH - reduction - smoke_bonus)
+    return max(6, PLANT_BASE_GROWTH - reduction - smoke_bonus - lamp_reduction)
 
 
 def farm_upgrade_cost(level: int) -> int:
@@ -185,6 +222,10 @@ def growth_upgrade_cost(level: int) -> int:
 
 def shield_upgrade_cost(level: int) -> int:
     return 800 + 400 * level
+
+
+def lamp_cost(current_lamps: int) -> int:
+    return 300 + current_lamps * 150
 
 
 def resolve_contraband(player: Dict[str, Any]) -> Optional[str]:
@@ -333,16 +374,16 @@ def action_smoke(player: Dict[str, Any]) -> str:
 def action_water(player: Dict[str, Any]) -> str:
     """Water all non-recently-watered plants for this player."""
     if not player["plants"]:
-        return "💧 You have no plants to water."
+        return tr(player, "no_plants_water")
     watered = 0
     for plant in player["plants"]:
         if now_ts() - int(plant.get("last_watered", 0)) > 60:
             plant["last_watered"] = now_ts()
             watered += 1
     if watered == 0:
-        return "💧 Plants were watered recently already."
+        return "💧 Растения уже недавно были политы."
     add_xp(player, 6)
-    return f"💧 Watered **{watered}** plants."
+    return tr(player, "water_done", count=watered)
 
 
 def action_care(player: Dict[str, Any]) -> str:
@@ -352,7 +393,7 @@ def action_care(player: Dict[str, Any]) -> str:
     for plant in player["plants"]:
         plant["care"] = min(7, int(plant.get("care", 0)) + 1)
     add_xp(player, 6)
-    return "🧤 Plant care done. Future harvest yields are improved."
+    return tr(player, "care_done")
 
 
 def action_balance(player: Dict[str, Any]) -> discord.Embed:
@@ -420,8 +461,21 @@ class GameMenuView(discord.ui.View):
         if action == "about":
             await safe_interaction_reply(
                 interaction,
-                content="I do not support drugs, this game is just for fun.",
+                content=tr(player, "about"),
             )
+            return
+        if action == "settings":
+            await safe_interaction_reply(
+                interaction,
+                content=tr(player, "settings"),
+                ephemeral=True,
+            )
+            await interaction.followup.send(
+                content="Выберите язык / Choose language:",
+                view=SettingsView(),
+                ephemeral=True,
+            )
+            return
 
     @discord.ui.button(label="Plant", style=discord.ButtonStyle.success)
     async def plant_btn(self, interaction: discord.Interaction, button: discord.ui.Button) -> None:
@@ -446,6 +500,10 @@ class GameMenuView(discord.ui.View):
     @discord.ui.button(label="About", style=discord.ButtonStyle.gray)
     async def about_btn(self, interaction: discord.Interaction, button: discord.ui.Button) -> None:
         await self._perform(interaction, "about")
+
+    @discord.ui.button(label="Settings", style=discord.ButtonStyle.gray)
+    async def settings_btn(self, interaction: discord.Interaction, button: discord.ui.Button) -> None:
+        await self._perform(interaction, "settings")
 
 
 class UpgradeShopView(discord.ui.View):
@@ -514,6 +572,21 @@ class UpgradeShopView(discord.ui.View):
             )
             return
 
+        if item == "lamp":
+            current = int(player.get("inventory", {}).get("lamps", 0))
+            price = lamp_cost(current)
+            if player["money"] < price:
+                await safe_interaction_reply(interaction, content=f"❌ Нужно ${price} для лампы.")
+                return
+            player["money"] -= price
+            player["inventory"]["lamps"] = current + 1
+            save_data(data)
+            await safe_interaction_reply(
+                interaction,
+                content=f"💡 Куплена лампа. Теперь ламп: {player['inventory']['lamps']} (цена ${price}).",
+            )
+            return
+
     @discord.ui.button(label="Farm Upgrade", style=discord.ButtonStyle.success)
     async def farm_button(self, interaction: discord.Interaction, button: discord.ui.Button) -> None:
         await self._buy(interaction, "farm")
@@ -525,6 +598,31 @@ class UpgradeShopView(discord.ui.View):
     @discord.ui.button(label="Shield", style=discord.ButtonStyle.danger)
     async def shield_button(self, interaction: discord.Interaction, button: discord.ui.Button) -> None:
         await self._buy(interaction, "shield")
+
+    @discord.ui.button(label="Lamp", style=discord.ButtonStyle.secondary)
+    async def lamp_button(self, interaction: discord.Interaction, button: discord.ui.Button) -> None:
+        await self._buy(interaction, "lamp")
+
+
+class SettingsView(discord.ui.View):
+    def __init__(self):
+        super().__init__(timeout=180)
+
+    @discord.ui.button(label="Русский", style=discord.ButtonStyle.primary)
+    async def ru_button(self, interaction: discord.Interaction, button: discord.ui.Button) -> None:
+        data = load_data()
+        player = get_player(data, interaction.user)
+        player["language"] = "ru"
+        save_data(data)
+        await safe_interaction_reply(interaction, content=tr(player, "language_set_ru"))
+
+    @discord.ui.button(label="English", style=discord.ButtonStyle.success)
+    async def en_button(self, interaction: discord.Interaction, button: discord.ui.Button) -> None:
+        data = load_data()
+        player = get_player(data, interaction.user)
+        player["language"] = "en"
+        save_data(data)
+        await safe_interaction_reply(interaction, content=tr(player, "language_set_en"))
 
 
 # ================================================================
@@ -545,12 +643,18 @@ async def on_ready() -> None:
 
 @bot.command(name="about")
 async def about_cmd(ctx: commands.Context) -> None:
-    await ctx.send("I do not support drugs, this game is just for fun.")
+    data = load_data()
+    player = get_player(data, ctx.author)
+    save_data(data)
+    await ctx.send(tr(player, "about"))
 
 
 @bot.command(name="menu")
 async def menu_cmd(ctx: commands.Context) -> None:
-    await ctx.send("🌿 Cannabis Economy Menu", view=GameMenuView())
+    data = load_data()
+    player = get_player(data, ctx.author)
+    save_data(data)
+    await ctx.send(tr(player, "menu_title"), view=GameMenuView())
 
 
 @bot.command(name="plant")
@@ -671,6 +775,21 @@ async def buy_chemical_cmd(ctx: commands.Context, amount: int) -> None:
     player["chemicals"] += amount
     save_data(data)
     await ctx.send(f"⚗️ Bought {amount} chemicals for ${cost}.")
+
+
+@bot.command(name="inventory")
+async def inventory_cmd(ctx: commands.Context) -> None:
+    data = load_data()
+    player = get_player(data, ctx.author)
+    inv = player.get("inventory", {})
+    text = (
+        f"{tr(player, 'inventory')}\n"
+        f"💡 Lamps: {inv.get('lamps', 0)}\n"
+        f"🧪 Fertilizers: {player.get('fertilizers', 0)}\n"
+        f"⚗️ Chemicals: {player.get('chemicals', 0)}"
+    )
+    save_data(data)
+    await ctx.send(text)
 
 
 @bot.command(name="balance")
@@ -809,10 +928,12 @@ async def farm_create(ctx: commands.Context, *, name: str) -> None:
         "name": name,
         "owner": str(ctx.author.id),
         "members": [str(ctx.author.id)],
+        "avatar_url": ctx.message.attachments[0].url if ctx.message.attachments else None,
     }
     player["farm"] = lname
     save_data(data)
-    await ctx.send(f"🏡 Farm **{name}** created.")
+    avatar_info = "\nАватар: прикреплён." if ctx.message.attachments else "\nАватар: не задан."
+    await ctx.send(f"🏡 Farm **{name}** created.{avatar_info}")
 
 
 @farm_group.command(name="join")
@@ -846,7 +967,8 @@ async def farm_info(ctx: commands.Context, *, name: Optional[str] = None) -> Non
         p = data["players"].get(uid)
         member_names.append(p["username"] if p else uid)
     await ctx.send(
-        f"🏡 **{farm['name']}**\nOwner: <@{farm['owner']}>\nMembers: {', '.join(member_names)}"
+        f"🏡 **{farm['name']}**\nOwner: <@{farm['owner']}>\nMembers: {', '.join(member_names)}\n"
+        f"Avatar: {farm.get('avatar_url') or 'нет'}"
     )
 
 
@@ -1087,11 +1209,11 @@ async def auction_claim(ctx: commands.Context, auction_id: str) -> None:
 @bot.command(name="help")
 async def help_cmd(ctx: commands.Context) -> None:
     await ctx.send(
-        "Commands: !menu !about !plant !harvest !dry !roll !smoke !balance "
+        "Команды: !menu !about !plant !harvest !dry !roll !smoke !balance "
         "!sell <amount> !duel @user <amount> !casino <amount> !daily !fightpolice "
         "!farm create/join/info !upgrade !exchange <joints> !contraband <country> "
         "!leaderboard !trade @user <joints> !water !care !autowater on/off "
-        "!buyfert <n> !buychem <n> !auction create/list/bid/claim"
+        "!buyfert <n> !buychem <n> !inventory !auction create/list/bid/claim"
     )
 
 
@@ -1220,7 +1342,7 @@ class BotRunnerThread(QtCore.QThread):
             except Exception as e:
                 self.status_signal.emit(f"Error: {e}")
             finally:
-                BOT_STATUS_CALLBACK = None
+                globals()["BOT_STATUS_CALLBACK"] = None
                 self.status_signal.emit("Bot not started")
 
         self.loop.run_until_complete(start_bot())
