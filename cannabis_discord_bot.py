@@ -49,6 +49,7 @@ RARITY_TABLE: List[Dict[str, Any]] = [
 
 DATA_LOCK = threading.RLock()
 BOT_STATUS_CALLBACK = None
+ALLOWED_GUILD_ID: Optional[int] = None
 
 I18N: Dict[str, Dict[str, str]] = {
     "ru": {
@@ -648,6 +649,16 @@ async def on_ready() -> None:
         tax_loop.start()
     if not police_loop.is_running():
         police_loop.start()
+
+
+@bot.event
+async def on_message(message: discord.Message) -> None:
+    if message.author.bot:
+        return
+    if ALLOWED_GUILD_ID is not None:
+        if message.guild is None or int(message.guild.id) != int(ALLOWED_GUILD_ID):
+            return
+    await bot.process_commands(message)
 
 
 @bot.command(name="about")
@@ -1613,17 +1624,19 @@ async def police_loop() -> None:
 class BotRunnerThread(QtCore.QThread):
     status_signal = QtCore.pyqtSignal(str)
 
-    def __init__(self, token: str):
+    def __init__(self, token: str, guild_id: Optional[int]):
         super().__init__()
         self.token = token
+        self.guild_id = guild_id
         self.loop: Optional[asyncio.AbstractEventLoop] = None
         self.stop_requested = False
 
     def run(self) -> None:
-        global BOT_STATUS_CALLBACK
+        global BOT_STATUS_CALLBACK, ALLOWED_GUILD_ID
         self.stop_requested = False
         self.status_signal.emit("Bot starting")
         BOT_STATUS_CALLBACK = self.status_signal.emit
+        ALLOWED_GUILD_ID = self.guild_id
         self.loop = asyncio.new_event_loop()
         asyncio.set_event_loop(self.loop)
 
@@ -1642,6 +1655,7 @@ class BotRunnerThread(QtCore.QThread):
                         pass
             finally:
                 globals()["BOT_STATUS_CALLBACK"] = None
+                globals()["ALLOWED_GUILD_ID"] = None
                 if self.stop_requested:
                     self.status_signal.emit("Bot not started")
                 elif not had_error:
@@ -1679,12 +1693,12 @@ class BotControlWindow(QtWidgets.QWidget):
 
     def setup_ui(self) -> None:
         self.setWindowTitle("Cannabis Economy Bot")
-        self.setFixedSize(480, 280)
+        self.setFixedSize(520, 420)
         self.setWindowFlags(QtCore.Qt.FramelessWindowHint | QtCore.Qt.WindowStaysOnTopHint)
         self.setAttribute(QtCore.Qt.WA_TranslucentBackground)
 
         container = QtWidgets.QFrame(self)
-        container.setGeometry(10, 10, 460, 260)
+        container.setGeometry(10, 10, 500, 400)
         container.setStyleSheet(
             """
             QFrame {
@@ -1725,24 +1739,45 @@ class BotControlWindow(QtWidgets.QWidget):
         self.token_input.setPlaceholderText("Enter bot token")
         self.token_input.setEchoMode(QtWidgets.QLineEdit.Password)
 
+        self.guild_input = QtWidgets.QLineEdit()
+        self.guild_input.setPlaceholderText("Guild ID (обязательно)")
+
         self.status_label = QtWidgets.QLabel("Bot not started")
         self.status_label.setAlignment(QtCore.Qt.AlignCenter)
+
+        self.info_box = QtWidgets.QPlainTextEdit()
+        self.info_box.setReadOnly(True)
+        self.info_box.setPlainText(
+            "Инструкция:\n"
+            "1) Вставь токен бота.\n"
+            "2) Введи Guild ID сервера, где бот должен работать.\n"
+            "3) Нажми Start.\n\n"
+            "Ссылка для создания приложения:\n"
+            "https://discord.com/developers/applications"
+        )
+        self.info_box.setVerticalScrollBarPolicy(QtCore.Qt.ScrollBarAlwaysOn)
+        self.info_box.setFixedHeight(130)
 
         buttons = QtWidgets.QHBoxLayout()
         self.start_btn = QtWidgets.QPushButton("Start")
         self.stop_btn = QtWidgets.QPushButton("Stop")
         self.stop_btn.setObjectName("stopBtn")
+        self.copy_link_btn = QtWidgets.QPushButton("Copy Invite Link")
 
         self.start_btn.clicked.connect(self.start_bot)
         self.stop_btn.clicked.connect(self.stop_bot)
+        self.copy_link_btn.clicked.connect(self.copy_invite_link)
 
         buttons.addWidget(self.start_btn)
         buttons.addWidget(self.stop_btn)
+        buttons.addWidget(self.copy_link_btn)
 
         layout.addWidget(title)
         layout.addWidget(self.token_input)
+        layout.addWidget(self.guild_input)
         layout.addLayout(buttons)
         layout.addWidget(self.status_label)
+        layout.addWidget(self.info_box)
 
     def update_status(self, text: str) -> None:
         self.status_label.setText(text)
@@ -1751,17 +1786,39 @@ class BotControlWindow(QtWidgets.QWidget):
 
     def start_bot(self) -> None:
         token = self.token_input.text().strip()
+        guild_raw = self.guild_input.text().strip()
         if not token:
             self.status_label.setText("Error")
+            return
+        if not guild_raw.isdigit():
+            self.status_label.setText("Error: Guild ID required")
             return
         if self.runner and self.runner.isRunning():
             self.status_label.setText("Bot already running")
             return
 
-        self.runner = BotRunnerThread(token)
+        self.runner = BotRunnerThread(token, int(guild_raw))
         self.runner.status_signal.connect(self.update_status)
         self.runner.start()
         self.status_label.setText("Bot starting")
+
+    def copy_invite_link(self) -> None:
+        guild_raw = self.guild_input.text().strip()
+        if not guild_raw.isdigit():
+            self.status_label.setText("Error: Guild ID required")
+            return
+
+        if bot.user is None:
+            # Fallback to dev portal link if bot is not logged in yet.
+            link = "https://discord.com/developers/applications"
+        else:
+            permissions = 8
+            link = (
+                f"https://discord.com/oauth2/authorize?client_id={bot.user.id}"
+                f"&permissions={permissions}&scope=bot%20applications.commands&guild_id={guild_raw}"
+            )
+        QtWidgets.QApplication.clipboard().setText(link)
+        self.status_label.setText("Link copied ✅")
 
     def stop_bot(self) -> None:
         if self.runner and self.runner.isRunning():
