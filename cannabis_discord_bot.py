@@ -97,10 +97,15 @@ def xp_to_next(level: int) -> int:
 def ensure_shape(data: Dict[str, Any]) -> Dict[str, Any]:
     data.setdefault("players", {})
     data.setdefault("farms", {})
+    data.setdefault("cartels", {})
+    data.setdefault("tournaments", {})
     data.setdefault("meta", {})
     data.setdefault("auctions", {})
     data["meta"].setdefault("active_raid", None)
     data["meta"].setdefault("next_auction_id", 1)
+    data["meta"].setdefault("next_tournament_id", 1)
+    data["meta"].setdefault("next_duel_id", 1)
+    data["meta"].setdefault("duels", {})
     return data
 
 
@@ -133,6 +138,8 @@ def default_player(username: str) -> Dict[str, Any]:
         "chemicals": 0,
         "inventory": {"lamps": 0},
         "language": "ru",
+        "cartel": None,
+        "reputation": {"street": 0, "police": 0},
         "farm": None,
         "contraband": None,
     }
@@ -174,6 +181,8 @@ def get_player(data: Dict[str, Any], user: discord.abc.User) -> Dict[str, Any]:
     players[uid].setdefault("chemicals", 0)
     players[uid].setdefault("inventory", {"lamps": 0})
     players[uid].setdefault("language", "ru")
+    players[uid].setdefault("cartel", None)
+    players[uid].setdefault("reputation", {"street": 0, "police": 0})
     return players[uid]
 
 
@@ -835,16 +844,93 @@ async def duel_cmd(ctx: commands.Context, target: discord.Member, amount: int) -
     p1 = get_player(data, ctx.author)
     p2 = get_player(data, target)
     if p1["money"] < amount or p2["money"] < amount:
-        await ctx.send("Both players must have enough money.")
+        await ctx.send("Оба игрока должны иметь нужную сумму.")
+        return
+    p1["money"] -= amount
+    p2["money"] -= amount
+    duel_id = str(data["meta"]["next_duel_id"])
+    data["meta"]["next_duel_id"] += 1
+    data["meta"]["duels"][duel_id] = {
+        "id": duel_id,
+        "fighter1": str(ctx.author.id),
+        "fighter2": str(target.id),
+        "pot": amount * 2,
+        "ends_at": now_ts() + 25,
+        "bets": [],
+        "resolved": False,
+    }
+    save_data(data)
+    await ctx.send(
+        f"⚔️ Дуэль #{duel_id} началась: {ctx.author.mention} vs {target.mention}.\n"
+        f"Банк: ${amount*2}. Ставки зрителей: `!betduel {duel_id} @игрок сумма` в течение 25с.\n"
+        f"Завершение: `!resolveduel {duel_id}`"
+    )
+
+
+@bot.command(name="betduel")
+async def bet_duel_cmd(ctx: commands.Context, duel_id: str, fighter: discord.Member, amount: int) -> None:
+    if amount <= 0:
+        await ctx.send("Ставка должна быть положительной.")
+        return
+    data = load_data()
+    bettor = get_player(data, ctx.author)
+    duel = data["meta"]["duels"].get(duel_id)
+    if not duel or duel.get("resolved"):
+        await ctx.send("Дуэль не найдена.")
+        return
+    if now_ts() > int(duel["ends_at"]):
+        await ctx.send("Окно ставок закрыто.")
+        return
+    if str(fighter.id) not in {duel["fighter1"], duel["fighter2"]}:
+        await ctx.send("Можно ставить только на участника дуэли.")
+        return
+    if bettor["money"] < amount:
+        await ctx.send("Недостаточно денег для ставки.")
+        return
+    bettor["money"] -= amount
+    duel["bets"].append(
+        {"user_id": str(ctx.author.id), "fighter_id": str(fighter.id), "amount": amount}
+    )
+    save_data(data)
+    await ctx.send(f"💸 Ставка принята: ${amount} на {fighter.mention} в дуэли #{duel_id}.")
+
+
+@bot.command(name="resolveduel")
+async def resolve_duel_cmd(ctx: commands.Context, duel_id: str) -> None:
+    data = load_data()
+    duel = data["meta"]["duels"].get(duel_id)
+    if not duel or duel.get("resolved"):
+        await ctx.send("Дуэль не найдена или уже завершена.")
+        return
+    if now_ts() < int(duel["ends_at"]):
+        await ctx.send("Дуэль ещё идёт.")
+        return
+    if str(ctx.author.id) not in {duel["fighter1"], duel["fighter2"]}:
+        await ctx.send("Только участник дуэли может завершить её.")
         return
 
-    winner, loser = (p1, p2) if random.random() < 0.5 else (p2, p1)
-    winner_name = ctx.author.mention if winner is p1 else target.mention
-    winner["money"] += amount
-    loser["money"] -= amount
-    add_xp(winner, 12)
+    winner_id = duel["fighter1"] if random.random() < 0.5 else duel["fighter2"]
+    winner = data["players"].get(winner_id)
+    if winner:
+        winner["money"] += int(duel["pot"])
+        winner["reputation"]["street"] = winner["reputation"].get("street", 0) + 2
+        add_xp(winner, 14)
+
+    total_bets = sum(int(b["amount"]) for b in duel["bets"])
+    winners_pool = sum(int(b["amount"]) for b in duel["bets"] if b["fighter_id"] == winner_id)
+    for bet in duel["bets"]:
+        if bet["fighter_id"] != winner_id:
+            continue
+        p = data["players"].get(bet["user_id"])
+        if not p:
+            continue
+        share = bet["amount"] / max(1, winners_pool)
+        payout = int(share * total_bets)
+        p["money"] += payout
+
+    duel["resolved"] = True
     save_data(data)
-    await ctx.send(f"⚔️ Duel ended! Winner: {winner_name} (+${amount}).")
+    await ctx.send(f"🏁 Дуэль #{duel_id} завершена. Победитель: <@{winner_id}>.")
 
 
 @bot.command(name="casino")
@@ -871,6 +957,7 @@ async def casino_cmd(ctx: commands.Context, amount: int) -> None:
         result = f"💎 JACKPOT! Won ${jackpot}!"
 
     add_xp(player, 10)
+    player["reputation"]["street"] = player["reputation"].get("street", 0) + 1
     save_data(data)
     await ctx.send(result)
 
@@ -904,6 +991,8 @@ async def fight_police_cmd(ctx: commands.Context) -> None:
         await ctx.send("You already joined the raid defense.")
         return
     raid["fighters"].append(uid)
+    player = get_player(data, ctx.author)
+    player["reputation"]["street"] = player["reputation"].get("street", 0) + 2
     save_data(data)
     await ctx.send("🛡️ You joined the raid defense!")
 
@@ -972,9 +1061,208 @@ async def farm_info(ctx: commands.Context, *, name: Optional[str] = None) -> Non
     )
 
 
+@bot.command(name="farmrank")
+async def farm_rank_cmd(ctx: commands.Context) -> None:
+    data = load_data()
+    ranking = []
+    for key, farm in data["farms"].items():
+        member_money = 0
+        for uid in farm.get("members", []):
+            p = data["players"].get(uid)
+            if p:
+                member_money += int(p.get("money", 0))
+        score = member_money + len(farm.get("members", [])) * 500
+        ranking.append((farm["name"], score, len(farm.get("members", []))))
+    ranking.sort(key=lambda x: x[1], reverse=True)
+    if not ranking:
+        await ctx.send("Нет данных по фермам.")
+        return
+    lines = [f"{i+1}. {name} | score: {score} | members: {members}" for i, (name, score, members) in enumerate(ranking[:10])]
+    await ctx.send("🏆 Рейтинг ферм:\n" + "\n".join(lines))
+
+
 @bot.command(name="upgrade")
 async def upgrade_cmd(ctx: commands.Context) -> None:
     await ctx.send("🛒 Upgrade Shop", view=UpgradeShopView())
+
+
+@bot.group(name="cartel", invoke_without_command=True)
+async def cartel_group(ctx: commands.Context) -> None:
+    await ctx.send("Используй: !cartel create <name> | !cartel join <name> | !cartel info | !cartel deposit <sum> | !cartel withdraw <sum>")
+
+
+@cartel_group.command(name="create")
+async def cartel_create(ctx: commands.Context, *, name: str) -> None:
+    data = load_data()
+    player = get_player(data, ctx.author)
+    key = name.lower().strip()
+    if key in data["cartels"]:
+        await ctx.send("Картель уже существует.")
+        return
+    data["cartels"][key] = {"name": name, "owner": str(ctx.author.id), "members": [str(ctx.author.id)], "bank": 0}
+    player["cartel"] = key
+    save_data(data)
+    await ctx.send(f"🕶️ Картель **{name}** создан.")
+
+
+@cartel_group.command(name="join")
+async def cartel_join(ctx: commands.Context, *, name: str) -> None:
+    data = load_data()
+    player = get_player(data, ctx.author)
+    key = name.lower().strip()
+    cartel = data["cartels"].get(key)
+    if not cartel:
+        await ctx.send("Картель не найден.")
+        return
+    uid = str(ctx.author.id)
+    if uid not in cartel["members"]:
+        cartel["members"].append(uid)
+    player["cartel"] = key
+    save_data(data)
+    await ctx.send(f"🤝 Вы вступили в картель **{cartel['name']}**.")
+
+
+@cartel_group.command(name="info")
+async def cartel_info(ctx: commands.Context) -> None:
+    data = load_data()
+    player = get_player(data, ctx.author)
+    key = player.get("cartel")
+    cartel = data["cartels"].get(key) if key else None
+    if not cartel:
+        await ctx.send("Вы не состоите в картеле.")
+        return
+    await ctx.send(
+        f"🕶️ **{cartel['name']}**\nБанк: ${cartel['bank']}\nУчастников: {len(cartel['members'])}\nВладелец: <@{cartel['owner']}>"
+    )
+
+
+@cartel_group.command(name="deposit")
+async def cartel_deposit(ctx: commands.Context, amount: int) -> None:
+    if amount <= 0:
+        await ctx.send("Сумма должна быть положительной.")
+        return
+    data = load_data()
+    player = get_player(data, ctx.author)
+    key = player.get("cartel")
+    cartel = data["cartels"].get(key) if key else None
+    if not cartel:
+        await ctx.send("Сначала вступите в картель.")
+        return
+    if player["money"] < amount:
+        await ctx.send("Недостаточно средств.")
+        return
+    player["money"] -= amount
+    cartel["bank"] += amount
+    save_data(data)
+    await ctx.send(f"💰 В банк картеля внесено ${amount}.")
+
+
+@cartel_group.command(name="withdraw")
+async def cartel_withdraw(ctx: commands.Context, amount: int) -> None:
+    if amount <= 0:
+        await ctx.send("Сумма должна быть положительной.")
+        return
+    data = load_data()
+    player = get_player(data, ctx.author)
+    key = player.get("cartel")
+    cartel = data["cartels"].get(key) if key else None
+    if not cartel:
+        await ctx.send("Сначала вступите в картель.")
+        return
+    if str(ctx.author.id) != cartel["owner"]:
+        await ctx.send("Снимать может только владелец картеля.")
+        return
+    if cartel["bank"] < amount:
+        await ctx.send("В банке картеля недостаточно средств.")
+        return
+    cartel["bank"] -= amount
+    player["money"] += amount
+    save_data(data)
+    await ctx.send(f"🏦 Из банка картеля снято ${amount}.")
+
+
+@bot.command(name="reputation")
+async def reputation_cmd(ctx: commands.Context) -> None:
+    data = load_data()
+    player = get_player(data, ctx.author)
+    rep = player.get("reputation", {})
+    save_data(data)
+    await ctx.send(f"📊 Репутация\nStreet: {rep.get('street', 0)}\nPolice: {rep.get('police', 0)}")
+
+
+@bot.group(name="casinotour", invoke_without_command=True)
+async def casino_tour_group(ctx: commands.Context) -> None:
+    await ctx.send("Используй: !casinotour create <buyin> | !casinotour join <id> | !casinotour start <id>")
+
+
+@casino_tour_group.command(name="create")
+async def casino_tour_create(ctx: commands.Context, buyin: int) -> None:
+    if buyin <= 0:
+        await ctx.send("Buy-in должен быть > 0.")
+        return
+    data = load_data()
+    player = get_player(data, ctx.author)
+    if player["money"] < buyin:
+        await ctx.send("Недостаточно денег.")
+        return
+    player["money"] -= buyin
+    tid = str(data["meta"]["next_tournament_id"])
+    data["meta"]["next_tournament_id"] += 1
+    data["tournaments"][tid] = {
+        "id": tid,
+        "owner": str(ctx.author.id),
+        "buyin": buyin,
+        "participants": [str(ctx.author.id)],
+        "started": False,
+    }
+    save_data(data)
+    await ctx.send(f"🎰 Турнир #{tid} создан. Взнос ${buyin}. Вход: !casinotour join {tid}")
+
+
+@casino_tour_group.command(name="join")
+async def casino_tour_join(ctx: commands.Context, tid: str) -> None:
+    data = load_data()
+    player = get_player(data, ctx.author)
+    tour = data["tournaments"].get(tid)
+    if not tour or tour.get("started"):
+        await ctx.send("Турнир не найден.")
+        return
+    if str(ctx.author.id) in tour["participants"]:
+        await ctx.send("Вы уже участвуете.")
+        return
+    buyin = int(tour["buyin"])
+    if player["money"] < buyin:
+        await ctx.send("Недостаточно денег.")
+        return
+    player["money"] -= buyin
+    tour["participants"].append(str(ctx.author.id))
+    save_data(data)
+    await ctx.send(f"✅ Вы вошли в турнир #{tid}.")
+
+
+@casino_tour_group.command(name="start")
+async def casino_tour_start(ctx: commands.Context, tid: str) -> None:
+    data = load_data()
+    tour = data["tournaments"].get(tid)
+    if not tour or tour.get("started"):
+        await ctx.send("Турнир не найден.")
+        return
+    if str(ctx.author.id) != tour["owner"]:
+        await ctx.send("Запускать может только создатель.")
+        return
+    players = tour["participants"]
+    if len(players) < 2:
+        await ctx.send("Нужно минимум 2 участника.")
+        return
+    winner_id = random.choice(players)
+    pot = int(tour["buyin"]) * len(players)
+    winner = data["players"].get(winner_id)
+    if winner:
+        winner["money"] += int(pot * 0.9)
+        winner["reputation"]["street"] = winner["reputation"].get("street", 0) + 3
+    tour["started"] = True
+    save_data(data)
+    await ctx.send(f"🏆 Турнир #{tid} завершён. Победитель: <@{winner_id}>. Приз: ${int(pot*0.9)}")
 
 
 @bot.command(name="exchange")
@@ -1211,9 +1499,10 @@ async def help_cmd(ctx: commands.Context) -> None:
     await ctx.send(
         "Команды: !menu !about !plant !harvest !dry !roll !smoke !balance "
         "!sell <amount> !duel @user <amount> !casino <amount> !daily !fightpolice "
-        "!farm create/join/info !upgrade !exchange <joints> !contraband <country> "
+        "!farm create/join/info !farmrank !upgrade !exchange <joints> !contraband <country> "
         "!leaderboard !trade @user <joints> !water !care !autowater on/off "
-        "!buyfert <n> !buychem <n> !inventory !auction create/list/bid/claim"
+        "!buyfert <n> !buychem <n> !inventory !auction create/list/bid/claim "
+        "!cartel ... !reputation !casinotour ... !betduel !resolveduel"
     )
 
 
