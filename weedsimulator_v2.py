@@ -47,6 +47,24 @@ RARITY_TABLE: List[Dict[str, Any]] = [
     {"name": "legendary", "weight": 4, "yield_min": 11, "yield_max": 16},
 ]
 
+BADGE_SHOP: List[Dict[str, Any]] = [
+    {"id": 1, "name": "🌱 Новичок Фермы", "price_met": 1},
+    {"id": 2, "name": "💧 Мастер Полива", "price_met": 1},
+    {"id": 3, "name": "🚬 Роллер", "price_met": 1},
+    {"id": 4, "name": "💸 Капиталист", "price_met": 2},
+    {"id": 5, "name": "🛡️ Защитник", "price_met": 2},
+    {"id": 6, "name": "🧪 Химик", "price_met": 2},
+    {"id": 7, "name": "🏡 Фермер PRO", "price_met": 2},
+    {"id": 8, "name": "🎰 Казино Король", "price_met": 3},
+    {"id": 9, "name": "🧳 Контрабандист", "price_met": 3},
+    {"id": 10, "name": "⚔️ Дуэлянт", "price_met": 3},
+    {"id": 11, "name": "🕶️ Картель Босс", "price_met": 4},
+    {"id": 12, "name": "🏆 Лидер", "price_met": 4},
+    {"id": 13, "name": "💎 VIP", "price_met": 5},
+    {"id": 14, "name": "🌌 Легенда", "price_met": 6},
+    {"id": 15, "name": "👑 Абсолют", "price_met": 8},
+]
+
 DATA_LOCK = threading.RLock()
 BOT_STATUS_CALLBACK = None
 ALLOWED_GUILD_ID: Optional[int] = None
@@ -115,6 +133,7 @@ def default_player(username: str) -> Dict[str, Any]:
         "username": username,
         "money": 400,
         "bank": 0,
+        "met": 0,
         "salt": 0,
         "xp": 0,
         "level": 1,
@@ -141,6 +160,7 @@ def default_player(username: str) -> Dict[str, Any]:
         "language": "ru",
         "cartel": None,
         "reputation": {"street": 0, "police": 0},
+        "badges": [],
         "farm": None,
         "contraband": None,
     }
@@ -184,6 +204,8 @@ def get_player(data: Dict[str, Any], user: discord.abc.User) -> Dict[str, Any]:
     players[uid].setdefault("language", "ru")
     players[uid].setdefault("cartel", None)
     players[uid].setdefault("reputation", {"street": 0, "police": 0})
+    players[uid].setdefault("met", 0)
+    players[uid].setdefault("badges", [])
     return players[uid]
 
 
@@ -410,6 +432,7 @@ def action_balance(player: Dict[str, Any]) -> discord.Embed:
     embed = discord.Embed(title="💼 Economy Balance", color=discord.Color.green())
     embed.add_field(name="Cash", value=f"${player['money']}", inline=True)
     embed.add_field(name="Bank", value=f"${player['bank']}", inline=True)
+    embed.add_field(name="Мёт", value=str(player.get("met", 0)), inline=True)
     embed.add_field(name="Salt", value=str(player["salt"]), inline=True)
     embed.add_field(name="Wet leaves", value=str(player["leaves_wet"]), inline=True)
     embed.add_field(name="Dry leaves", value=str(player["leaves_dry"]), inline=True)
@@ -421,6 +444,7 @@ def action_balance(player: Dict[str, Any]) -> discord.Embed:
     embed.add_field(name="Auto-water", value="On" if player.get("auto_watering") else "Off", inline=True)
     embed.add_field(name="Fertilizers", value=str(player.get("fertilizers", 0)), inline=True)
     embed.add_field(name="Chemicals", value=str(player.get("chemicals", 0)), inline=True)
+    embed.add_field(name="Badges", value=str(len(player.get("badges", []))), inline=True)
     return embed
 
 
@@ -806,10 +830,75 @@ async def inventory_cmd(ctx: commands.Context) -> None:
         f"{tr(player, 'inventory')}\n"
         f"💡 Lamps: {inv.get('lamps', 0)}\n"
         f"🧪 Fertilizers: {player.get('fertilizers', 0)}\n"
-        f"⚗️ Chemicals: {player.get('chemicals', 0)}"
+        f"⚗️ Chemicals: {player.get('chemicals', 0)}\n"
+        f"🪙 Мёт: {player.get('met', 0)}\n"
+        f"🏅 Badge count: {len(player.get('badges', []))}"
     )
     save_data(data)
     await ctx.send(text)
+
+
+@bot.command(name="met")
+async def met_cmd(ctx: commands.Context, units: Optional[int] = None) -> None:
+    """Convert ready joints to new currency: 1 мёт = 500 joints."""
+    data = load_data()
+    player = get_player(data, ctx.author)
+    possible = player["joints"] // 500
+    if possible <= 0:
+        await ctx.send("Недостаточно косяков. Нужно минимум 500 косяков на 1 мёт.")
+        return
+    if units is None:
+        units = possible
+    if units <= 0 or units > possible:
+        await ctx.send(f"Можно обменять от 1 до {possible} мёт.")
+        return
+    player["joints"] -= units * 500
+    player["met"] += units
+    save_data(data)
+    await ctx.send(f"🪙 Обмен выполнен: +{units} мёт за {units*500} косяков.")
+
+
+@bot.group(name="badges", invoke_without_command=True)
+async def badges_group(ctx: commands.Context) -> None:
+    await ctx.send("Используй: !badges shop | !badges buy <id> | !badges list")
+
+
+@badges_group.command(name="shop")
+async def badges_shop_cmd(ctx: commands.Context) -> None:
+    lines = [f"{b['id']}. {b['name']} — {b['price_met']} мёт" for b in BADGE_SHOP]
+    await ctx.send("🏅 Магазин бейджей (15 штук):\n" + "\n".join(lines))
+
+
+@badges_group.command(name="buy")
+async def badges_buy_cmd(ctx: commands.Context, badge_id: int) -> None:
+    badge = next((b for b in BADGE_SHOP if b["id"] == badge_id), None)
+    if not badge:
+        await ctx.send("Бейдж не найден.")
+        return
+    data = load_data()
+    player = get_player(data, ctx.author)
+    if badge["name"] in player.get("badges", []):
+        await ctx.send("У тебя уже есть этот бейдж.")
+        return
+    if player.get("met", 0) < badge["price_met"]:
+        await ctx.send("Недостаточно валюты мёт.")
+        return
+    player["met"] -= badge["price_met"]
+    player["badges"].append(badge["name"])
+    save_data(data)
+    await ctx.send(f"✅ Куплен бейдж: {badge['name']}")
+
+
+@badges_group.command(name="list")
+async def badges_list_cmd(ctx: commands.Context) -> None:
+    data = load_data()
+    player = get_player(data, ctx.author)
+    items = player.get("badges", [])
+    save_data(data)
+    if not items:
+        await ctx.send("У тебя пока нет бейджей.")
+        return
+    await ctx.send("🏅 Твои бейджи:\n" + "\n".join(items))
 
 
 @bot.command(name="balance")
@@ -1505,6 +1594,61 @@ async def auction_claim(ctx: commands.Context, auction_id: str) -> None:
     await ctx.send(msg)
 
 
+@bot.group(name="vipauction", invoke_without_command=True)
+async def vip_auction_group(ctx: commands.Context) -> None:
+    await ctx.send("Используй: !vipauction create <joints> <min_bid> | !vipauction list")
+
+
+@vip_auction_group.command(name="create")
+async def vip_auction_create(ctx: commands.Context, joints: int, min_bid: int) -> None:
+    if joints <= 0 or min_bid <= 0:
+        await ctx.send("Значения должны быть > 0.")
+        return
+    data = load_data()
+    player = get_player(data, ctx.author)
+    if player.get("met", 0) < 1:
+        await ctx.send("Для VIP-аукциона нужен 1 мёт.")
+        return
+    if player["joints"] < joints:
+        await ctx.send("Недостаточно косяков.")
+        return
+    player["met"] -= 1
+    player["joints"] -= joints
+    auction_id = str(data["meta"]["next_auction_id"])
+    data["meta"]["next_auction_id"] += 1
+    data["auctions"][auction_id] = {
+        "id": auction_id,
+        "seller": str(ctx.author.id),
+        "joints": joints,
+        "min_bid": min_bid,
+        "highest_bid": min_bid - 1,
+        "highest_bidder": None,
+        "ends_at": now_ts() + 180,
+        "claimed": False,
+        "vip": True,
+    }
+    save_data(data)
+    await ctx.send(f"💎 VIP-аукцион #{auction_id} создан (списано 1 мёт).")
+
+
+@vip_auction_group.command(name="list")
+async def vip_auction_list(ctx: commands.Context) -> None:
+    data = load_data()
+    lines = []
+    for item in data["auctions"].values():
+        if not item.get("vip"):
+            continue
+        if now_ts() > int(item["ends_at"]) or item.get("claimed"):
+            continue
+        left = int(item["ends_at"]) - now_ts()
+        top = item["highest_bid"] if item["highest_bidder"] else item["min_bid"]
+        lines.append(f"#{item['id']} | {item['joints']} joints | top ${top} | {left}s")
+    if not lines:
+        await ctx.send("Нет активных VIP-аукционов.")
+        return
+    await ctx.send("💎 VIP-аукционы:\n" + "\n".join(lines))
+
+
 @bot.command(name="help")
 async def help_cmd(ctx: commands.Context) -> None:
     await ctx.send(
@@ -1512,7 +1656,8 @@ async def help_cmd(ctx: commands.Context) -> None:
         "!sell <amount> !duel @user <amount> !casino <amount> !daily !fightpolice "
         "!farm create/join/info !farmrank !upgrade !exchange <joints> !contraband <country> "
         "!leaderboard !trade @user <joints> !water !care !autowater on/off "
-        "!buyfert <n> !buychem <n> !inventory !auction create/list/bid/claim "
+        "!buyfert <n> !buychem <n> !inventory !met [units] !badges ... "
+        "!auction create/list/bid/claim !vipauction ... "
         "!cartel ... !reputation !casinotour ... !betduel !resolveduel"
     )
 
